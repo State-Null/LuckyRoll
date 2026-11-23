@@ -16,7 +16,7 @@ import struct
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -1514,6 +1514,201 @@ def build_0x20_section(
 CARD_MESH_TAGS = ("c1", "c2", "c3", "c4", "c5", "c6", "wc")
 THEME_BY_KEY: Dict[str, CardTheme] = {t.key: t for t in CARD_THEMES.values()}
 
+PHANTOM_RETAIL_LIFE = 88
+PHANTOM_EXTEND_LIFE = 150
+PHANTOM_TAIL_DELTA = PHANTOM_EXTEND_LIFE - PHANTOM_RETAIL_LIFE
+PHANTOM_PJ_GENS: Set[str] = {f"pj{i:02d}" for i in range(1, 12)} | {"pjbu"}
+PHANTOM_YC_SCHEDS: Set[str] = {f"yc{i:02d}" for i in range(1, 13)}
+PHANTOM_JA00_FLOATS: List[float] = [0.0, 0.0, 0.20, 0.42, 0.88, 0.42, 0.95, 0.04, 1.0, 0.0, 0.0, 0.0]
+PHANTOM_JA01_FLOATS: List[float] = [0.0, 0.0, 0.08, 0.42, 0.82, 0.42, 0.93, 0.04, 1.0, 0.0, 0.0, 0.0]
+
+CARD_SP_RETAIL_LIFE = 64
+CARD_SP_EXTEND_LIFE = 120
+CARD_SP_TAIL_DELTA = 30
+CARD_SP_JA00_FLOATS: List[float] = [0.0, 0.0, 0.13, 0.42, 0.85, 0.42, 0.91, 0.18, 0.955, 0.052, 1.0, 0.0]
+CARD_SP_JSSX_TIMES: List[float] = [0.85, 0.87, 0.89, 0.92, 1.0]
+
+
+def build_timing_map() -> Dict[str, Tuple[str, Optional[int]]]:
+    """Return mapping: rel_dat_path -> (timing_mode, sp_index_or_none)."""
+    timing: Dict[str, Tuple[str, Optional[int]]] = {}
+    for rel, _, _, _ in PHANTOM_ROLLS:
+        timing[rel] = ("phantom", None)
+    for idx, rel in enumerate(WILD_CARD_DATS, start=1):
+        timing[rel] = ("card_sp", idx)
+    for idx, rel in enumerate(CUTTING_CARDS_DATS, start=1):
+        timing[rel] = ("card_sp", idx)
+    return timing
+
+
+def patch_0x05_life(raw: bytes, old_life: int, new_life: int) -> bytes:
+    """Extend particle lifetime (uint16 frames at +0xC2) inside a 0x05 generator."""
+    cur_life = struct.unpack_from("<H", raw, 0xC2)[0]
+    if cur_life != old_life:
+        raise ValueError(f"0x05 generator unexpected lifetime {cur_life} != {old_life}")
+    buf = bytearray(raw)
+    struct.pack_into("<H", buf, 0xC2, new_life)
+    return bytes(buf)
+
+
+def patch_0x07_duration(
+    raw: bytes,
+    target_gen_tags: Set[str],
+    old_dur: int,
+    new_dur: int,
+    tail_delta: int,
+    expected_tail_f1: Optional[int] = None,
+) -> bytes:
+    """Extend a target generator spawn duration (f2) and tail wait (f1 + total_frames) in a 0x07 scheduler."""
+    main_off, end_off, tf = struct.unpack_from("<III", raw, 0x24)
+    buf = bytearray(raw)
+
+    off = main_off
+    sum_f1 = 0
+    patched_gen = 0
+    last_cmd_off: Optional[int] = None
+    while off < end_off:
+        op = buf[off]
+        dw = buf[off + 1]
+        if dw == 0:
+            raise ValueError(f"Invalid zero-length command at +0x{off:x}")
+        sz = dw * 4
+        if op == 0x00:
+            break
+        if op != 0x01:
+            f1, f2 = struct.unpack_from("<HH", buf, off + 4)
+            sum_f1 += f1
+            last_cmd_off = off
+            if op == 0x02 and sz >= 12:
+                tag = bytes(buf[off + 8 : off + 12]).decode("ascii", "replace").strip()
+                if tag in target_gen_tags:
+                    if f2 != old_dur:
+                        raise ValueError(f"0x07 tag {tag!r} unexpected dur {f2} != {old_dur}")
+                    struct.pack_into("<H", buf, off + 6, new_dur)
+                    patched_gen += 1
+        off += sz
+
+    if sum_f1 != tf:
+        raise ValueError(f"0x07 pre-patch frame sum {sum_f1} != total_frames {tf}")
+    if patched_gen != 1:
+        raise ValueError(f"0x07 expected 1 target generator match, got {patched_gen}")
+    if last_cmd_off is None:
+        raise ValueError("0x07 scheduler missing non-START commands")
+
+    tail_f1 = struct.unpack_from("<H", buf, last_cmd_off + 4)[0]
+    if expected_tail_f1 is not None and tail_f1 != expected_tail_f1:
+        raise ValueError(f"0x07 tail f1 {tail_f1} != expected {expected_tail_f1}")
+    struct.pack_into("<H", buf, last_cmd_off + 4, tail_f1 + tail_delta)
+    new_tf = tf + tail_delta
+    struct.pack_into("<I", buf, 0x2C, new_tf)
+
+    # Re-walk to verify frame invariant
+    off = main_off
+    check_sum = 0
+    while off < end_off:
+        op, dw = buf[off], buf[off + 1]
+        if op == 0x00:
+            break
+        if op != 0x01:
+            check_sum += struct.unpack_from("<H", buf, off + 4)[0]
+        off += dw * 4
+    if check_sum != new_tf or len(buf) != len(raw):
+        raise AssertionError(f"0x07 post-patch frame mismatch sum={check_sum} tf={new_tf}")
+    return bytes(buf)
+
+
+def patch_0x19_floats(raw: bytes, new_floats: List[float]) -> bytes:
+    """Replace 0x19 keyframe (time, value) float pairs in-place after validating monotonic timestamps."""
+    n_floats = (len(raw) - 16) // 4
+    if n_floats != len(new_floats):
+        raise ValueError(f"0x19 float count mismatch: section has {n_floats}, got {len(new_floats)}")
+
+    prev_t = -1.0
+    for idx in range(0, n_floats, 2):
+        t = new_floats[idx]
+        if t < prev_t or t < 0.0 or t > 1.0:
+            raise ValueError(f"0x19 non-monotonic or out-of-range timestamp {t} after {prev_t}")
+        prev_t = t
+        if t >= 1.0 - 1e-6:
+            break
+
+    buf = bytearray(raw)
+    struct.pack_into(f"<{n_floats}f", buf, 16, *new_floats)
+    return bytes(buf)
+
+
+def _scale_0x19_interior_times(raw: bytes, ratio: float) -> bytes:
+    """Scale interior timestamps (0 < t < 1 before first t == 1.0) in a 0x19 keyframe section."""
+    n_floats = (len(raw) - 16) // 4
+    floats = list(struct.unpack_from(f"<{n_floats}f", raw, 16))
+    for idx in range(0, n_floats, 2):
+        t = floats[idx]
+        if t >= 1.0 - 1e-6:
+            break
+        if t > 0.0:
+            floats[idx] = t * ratio
+    return patch_0x19_floats(raw, floats)
+
+
+def patch_timing_section(
+    sec: DatSection, timing_mode: Optional[Tuple[str, Optional[int]]]
+) -> Optional[bytes]:
+    """Return duration-extended bytes for targeted 0x05/0x07/0x19 sections, or None if untouched."""
+    if timing_mode is None:
+        return None
+    mode, sp_idx = timing_mode
+    tag = sec.name.decode("ascii", "replace").strip()
+
+    if mode == "phantom":
+        if sec.stype == 0x05 and tag in PHANTOM_PJ_GENS:
+            return patch_0x05_life(sec.raw, PHANTOM_RETAIL_LIFE, PHANTOM_EXTEND_LIFE)
+        if sec.stype == 0x07 and tag in PHANTOM_YC_SCHEDS:
+            return patch_0x07_duration(
+                sec.raw, PHANTOM_PJ_GENS, PHANTOM_RETAIL_LIFE, PHANTOM_EXTEND_LIFE, PHANTOM_TAIL_DELTA
+            )
+        if sec.stype == 0x19:
+            if tag == "ja00":
+                return patch_0x19_floats(sec.raw, PHANTOM_JA00_FLOATS)
+            if tag == "ja01":
+                return patch_0x19_floats(sec.raw, PHANTOM_JA01_FLOATS)
+            if tag in ("pjsx", "pjyy"):
+                return _scale_0x19_interior_times(sec.raw, PHANTOM_RETAIL_LIFE / PHANTOM_EXTEND_LIFE)
+        return None
+
+    if mode == "card_sp":
+        assert sp_idx is not None
+        target_j = f"j0{sp_idx}0"
+        if sec.stype == 0x05 and tag == target_j:
+            return patch_0x05_life(sec.raw, CARD_SP_RETAIL_LIFE, CARD_SP_EXTEND_LIFE)
+        if sec.stype == 0x07 and tag.startswith("xc"):
+            return patch_0x07_duration(
+                sec.raw,
+                {target_j},
+                CARD_SP_RETAIL_LIFE,
+                CARD_SP_EXTEND_LIFE,
+                CARD_SP_TAIL_DELTA,
+                expected_tail_f1=52,
+            )
+        if sec.stype == 0x19:
+            if tag == "ja00":
+                return patch_0x19_floats(sec.raw, CARD_SP_JA00_FLOATS)
+            if tag in ("jpy0", "jry0"):
+                return _scale_0x19_interior_times(sec.raw, CARD_SP_RETAIL_LIFE / CARD_SP_EXTEND_LIFE)
+            if tag == "jssx":
+                n_floats = (len(sec.raw) - 16) // 4
+                if n_floats != 16:
+                    raise ValueError(f"card_sp jssx expected 16 floats, got {n_floats}")
+                floats = list(struct.unpack_from("<16f", sec.raw, 16))
+                ratio = CARD_SP_RETAIL_LIFE / CARD_SP_EXTEND_LIFE
+                floats[2] *= ratio
+                floats[4] *= ratio
+                for pair_idx, new_t in enumerate(CARD_SP_JSSX_TIMES, start=3):
+                    floats[pair_idx * 2] = new_t
+                return patch_0x19_floats(sec.raw, floats)
+        return None
+
+    raise ValueError(f"Unknown timing_mode: {timing_mode!r}")
+
 
 def build_target_map() -> Dict[str, Tuple[str, Dict[str, Tuple[str, object]], bool, Optional[bytes]]]:
     """Return mapping: rel_dat_path -> (label, {sec_tag_str: (kind, value)}, has_cards, tex_prefix)."""
@@ -1567,14 +1762,17 @@ def patch_dat(
     unwrap_cards: bool,
     tex_prefix: Optional[bytes],
     dxt_cache: Dict[Tuple[str, object], Tuple[int, int, bytes]],
-) -> Tuple[int, int, int]:
-    """Patch target 0x20 textures, unwrap 0x1F card meshes, and isolate roll tex namespaces."""
+    timing_mode: Optional[Tuple[str, Optional[int]]] = None,
+    extend_duration: bool = False,
+) -> Tuple[int, int, int, int]:
+    """Patch target 0x20 textures, unwrap 0x1F card meshes, isolate tex namespaces, and optionally extend timing."""
     raw = retail_path.read_bytes()
     sections = parse_sections(raw)
     out_chunks: List[bytes] = []
     replaced = 0
     unwrapped = 0
     renamed_refs = 0
+    timed = 0
 
     for sec in sections:
         tag = sec.name.decode("ascii", "replace").strip()
@@ -1604,7 +1802,12 @@ def patch_dat(
                 renamed_refs += cnt
             out_chunks.append(chunk)
         else:
-            out_chunks.append(sec.raw)
+            patched_timing = patch_timing_section(sec, timing_mode) if extend_duration else None
+            if patched_timing is not None:
+                out_chunks.append(patched_timing)
+                timed += 1
+            else:
+                out_chunks.append(sec.raw)
 
     if replaced != len(spec):
         raise ValueError(
@@ -1618,10 +1821,16 @@ def patch_dat(
         raise ValueError(
             f"{retail_path}: expected 38 0x1F texture ref renames, got {renamed_refs}"
         )
+    if extend_duration and timing_mode is not None:
+        exp_timed = 28 if timing_mode[0] == "phantom" else 6
+        if timed != exp_timed:
+            raise ValueError(
+                f"{retail_path}: expected {exp_timed} timing patches ({timing_mode[0]}), got {timed}"
+            )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(b"".join(out_chunks))
-    return replaced, unwrapped, renamed_refs
+    return replaced, unwrapped, renamed_refs, timed
 
 
 def _classify_decoded_color(img: Image.Image) -> str:
@@ -1644,12 +1853,18 @@ def _classify_decoded_color(img: Image.Image) -> str:
     return f"other({r:.0f},{g:.0f},{b:.0f})"
 
 
-def verify_pack(pack_dir: Path, retail_root: Path = RETAIL_ROOT) -> Tuple[int, int, int, int]:
-    """Verify binary integrity, namespace isolation, card meshes, and decoded DXT3 textures."""
+def verify_pack(
+    pack_dir: Path,
+    retail_root: Path = RETAIL_ROOT,
+    extend_duration: bool = False,
+) -> Tuple[int, int, int, int, int]:
+    """Verify binary integrity, namespace isolation, card meshes, DXT3 textures, and optional timing."""
     targets = build_target_map()
+    timing_map = build_timing_map() if extend_duration else {}
     dat_count = 0
     tex_count = 0
     mesh_count = 0
+    timing_count = 0
     unique_roll_tex_names = set()
     expected_color = {
         "normal": "white",
@@ -1675,6 +1890,8 @@ def verify_pack(pack_dir: Path, retail_root: Path = RETAIL_ROOT) -> Tuple[int, i
         seen_tags = set()
         seen_meshes = set()
         renamed_refs = 0
+        dat_timed = 0
+        timing_mode = timing_map.get(rel)
         for rs, ms in zip(r_secs, m_secs):
             if rs.name != ms.name or rs.stype != ms.stype:
                 raise AssertionError(f"{rel}: section mismatch {rs.name!r} vs {ms.name!r}")
@@ -1732,7 +1949,13 @@ def verify_pack(pack_dir: Path, retail_root: Path = RETAIL_ROOT) -> Tuple[int, i
                     raise AssertionError(f"{rel} {tag}: 0x1F mesh mismatch outside texture ref rename!")
                 renamed_refs += r_cnt
             else:
-                if rs.raw != ms.raw:
+                expected_timing = patch_timing_section(rs, timing_mode) if extend_duration else None
+                if expected_timing is not None:
+                    if ms.raw != expected_timing:
+                        raise AssertionError(f"{rel} {tag}: timing section does not match extended timing!")
+                    dat_timed += 1
+                    timing_count += 1
+                elif rs.raw != ms.raw:
                     raise AssertionError(f"{rel} {tag}: non-target section altered!")
 
         if seen_tags != set(spec.keys()):
@@ -1745,11 +1968,17 @@ def verify_pack(pack_dir: Path, retail_root: Path = RETAIL_ROOT) -> Tuple[int, i
             for old_name in RENAMED_COR_OLD_NAMES:
                 if old_name in mod_bytes:
                     raise AssertionError(f"{rel}: leftover colliding texture name {old_name!r}")
+        if extend_duration and timing_mode is not None:
+            exp_dat_timed = 28 if timing_mode[0] == "phantom" else 6
+            if dat_timed != exp_dat_timed:
+                raise AssertionError(f"{rel}: expected {exp_dat_timed} timing sections, got {dat_timed}")
         dat_count += 1
 
     if len(unique_roll_tex_names) != 31 * 14:
         raise AssertionError(f"Expected 434 unique roll texture names, got {len(unique_roll_tex_names)}")
-    return dat_count, tex_count, mesh_count, len(unique_roll_tex_names)
+    if extend_duration and timing_count != 940:
+        raise AssertionError(f"Expected 940 extended timing sections, got {timing_count}")
+    return dat_count, tex_count, mesh_count, len(unique_roll_tex_names), timing_count
 
 
 def _extract_dat_texture(dat_path: Path, tag: str) -> Image.Image:
@@ -2038,9 +2267,11 @@ def build_all(
     retail_root: Path = RETAIL_ROOT,
     compare_root: Optional[Path] = None,
     skip_zip: bool = False,
+    extend_duration: bool = False,
 ) -> None:
     """Render all unique roll & card graphics once, patch all 44 retail DATs, and emit previews."""
     targets = build_target_map()
+    timing_map = build_timing_map() if extend_duration else {}
     unique_keys = sorted(
         {kv for _, spec, _, _ in targets.values() for kv in spec.values()},
         key=lambda kv: (kv[0], repr(kv[1])),
@@ -2064,22 +2295,37 @@ def build_all(
     total_tex = 0
     total_meshes = 0
     total_renamed = 0
+    total_timed = 0
     for rel, (label, spec, has_cards, tex_prefix) in targets.items():
         retail_p = retail_root / rel
         out_p = out_pack / rel
-        r_tex, u_mesh, r_ref = patch_dat(retail_p, out_p, spec, has_cards, tex_prefix, dxt_cache)
+        r_tex, u_mesh, r_ref, r_timed = patch_dat(
+            retail_p,
+            out_p,
+            spec,
+            has_cards,
+            tex_prefix,
+            dxt_cache,
+            timing_mode=timing_map.get(rel),
+            extend_duration=extend_duration,
+        )
         total_tex += r_tex
         total_meshes += u_mesh
         total_renamed += r_ref
+        total_timed += r_timed
 
+    timing_msg = f", {total_timed} extended timing secs" if extend_duration else ""
     print(
         f"Patched {len(targets)} DATs ({total_tex} textures, {total_meshes} card meshes, "
-        f"{total_renamed} isolated mesh refs). Verifying..."
+        f"{total_renamed} isolated mesh refs{timing_msg}). Verifying..."
     )
-    dat_cnt, tex_cnt, mesh_cnt, uniq_cnt = verify_pack(out_pack, retail_root=retail_root)
+    dat_cnt, tex_cnt, mesh_cnt, uniq_cnt, ver_timed = verify_pack(
+        out_pack, retail_root=retail_root, extend_duration=extend_duration
+    )
+    ver_timing_msg = f", and {ver_timed} extended timing sections" if extend_duration else ""
     print(
         f"PASS: Verified {dat_cnt} DATs, {tex_cnt} DXT3 textures, "
-        f"{mesh_cnt} card meshes, and {uniq_cnt} unique roll texture names."
+        f"{mesh_cnt} card meshes, {uniq_cnt} unique roll texture names{ver_timing_msg}."
     )
 
     if num_preview_paths:
@@ -2106,6 +2352,11 @@ def main() -> None:
     global FONT_PATH
     parser = argparse.ArgumentParser(description="Build and verify LuckyRoll XIPivot pack.")
     parser.add_argument("--verify", action="store_true", help="Verify an existing LuckyRoll build only.")
+    parser.add_argument(
+        "--extend-duration",
+        action="store_true",
+        help="Extend floating result number display durations on Phantom Rolls, Wild Card, and Cutting Cards.",
+    )
     parser.add_argument(
         "--ffxi-root",
         type=Path,
@@ -2136,11 +2387,20 @@ def main() -> None:
         parser.error(f"Retail ROM directory not found under --ffxi-root: {retail_root}")
 
     if args.verify:
-        dat_cnt, tex_cnt, mesh_cnt, uniq_cnt = verify_pack(args.out, retail_root=retail_root)
-        print(
-            f"VERIFY PASS: {dat_cnt}/44 DATs, {tex_cnt}/531 textures, "
-            f"{mesh_cnt}/301 card meshes, and {uniq_cnt}/434 unique roll texture names verified cleanly."
+        dat_cnt, tex_cnt, mesh_cnt, uniq_cnt, ver_timed = verify_pack(
+            args.out, retail_root=retail_root, extend_duration=args.extend_duration
         )
+        if args.extend_duration:
+            print(
+                f"VERIFY PASS: {dat_cnt}/44 DATs, {tex_cnt}/531 textures, "
+                f"{mesh_cnt}/301 card meshes, {uniq_cnt}/434 unique roll texture names, "
+                f"and {ver_timed}/940 extended timing sections verified cleanly."
+            )
+        else:
+            print(
+                f"VERIFY PASS: {dat_cnt}/44 DATs, {tex_cnt}/531 textures, "
+                f"{mesh_cnt}/301 card meshes, and {uniq_cnt}/434 unique roll texture names verified cleanly."
+            )
         return
 
     compare_root = args.compare_root if args.compare_root is not None else retail_root
@@ -2154,6 +2414,7 @@ def main() -> None:
         retail_root=retail_root,
         compare_root=compare_root,
         skip_zip=(args.zip is None),
+        extend_duration=args.extend_duration,
     )
 
 
