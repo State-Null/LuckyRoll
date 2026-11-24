@@ -21,6 +21,19 @@ No more squinting at spinning Roman numerals or guessing whether a flash in Sort
 
 ---
 
+## Choose Your Version (2 Included Packs)
+
+Both ready-to-drop XIPivot packs share the exact same HD numerals, 33 custom Tarot Cards, and texture namespace isolation — the only difference is animation timing:
+
+| Pack Folder | Timing Style | Best For |
+|---|---|---|
+| **`LuckyRoll/`** | **Standard (Stock Retail Timing)** | Players using DressUp blink prevention (`//du blinking all always on`) or wanting the original retail suspense (cards spin → winning card pops → total number appears at `3.23s`). |
+| **`LuckyRoll_BlinkSafe/`** | **Blink-Safe Fast Reveal** *(Recommended for viewing blinking CORs)* | Sped up for viewing Corsairs who swap weapons (`Sword ↔ Rostam`, ranged swaps) without blink protection. Launches **both the spinning cards and the big total number at Frame 0 (`0.00s`)**, extends the card ring (`1.00s → 1.83s`), widens the popped card hold (`0.31s → 1.21s`), and holds the roll total (`1.47s → 2.50s`) plus Wild Card / Cutting Cards (`1.07s → 2.00s`) so you clearly see the number and cards *before* their aftercast weapon-swap blink cuts off the animation — with **zero** extra character animation lock. |
+
+> **Why two packs?** On retail FFXI, the floating total number doesn't spawn until **`3.23s`**. If a COR swaps weapons in GearSwap `aftercast`, that blink cancels the animation around `1–2s` — meaning observers on stock timing often see nothing at all. `LuckyRoll_BlinkSafe/` beats that blink by moving cards & numbers to Frame 0. *(Note: if a COR blinks on **precast** the exact frame the roll fires, FFXI skips starting the animation altogether — pair with `//du blinking all always on` in DressUp if needed.)*
+
+---
+
 ## Features
 
 - **Ultra-Readable Arabic Numerals (`256×256` DXT3 + `512×256` `BUST!`)**: Heavy sans-serif glyphs (`1`–`11` & `BUST!`) with outward Euclidean distance-transform pitch-black outlines and drop shadows so numbers pop cleanly against both dark Sortie arenas and bright snow zones.
@@ -56,19 +69,21 @@ No more squinting at spinning Roman numerals or guessing whether a flash in Sort
 
 ## Installation (Windower 4 + XIPivot)
 
-1. Download this repository (or clone it / grab the release zip) and place the `LuckyRoll` folder inside your Windower XIPivot `DATs` directory:
+1. Download this repository (or clone it / grab the release zip) and pick **one** folder — **`LuckyRoll`** (Standard) or **`LuckyRoll_BlinkSafe`** (Blink-Safe Fast Reveal) — and place it inside your Windower XIPivot `DATs` directory:
    ```text
    Windower4/addons/XIPivot/data/DATs/LuckyRoll/
    ```
-   Confirm the ROM directory sits directly underneath:
+   *or*
    ```text
-   Windower4/addons/XIPivot/data/DATs/LuckyRoll/ROM/162/...
+   Windower4/addons/XIPivot/data/DATs/LuckyRoll_BlinkSafe/
    ```
-2. Add `LuckyRoll` **first** in `<overlays>` in `Windower4/addons/XIPivot/data/settings.xml` (ahead of global HD packs such as `NextHD` so LuckyRoll overrides their roll DATs cleanly):
+   Confirm the `ROM/` directory sits directly underneath your chosen pack folder.
+2. Add your chosen pack **first** in `<overlays>` in `Windower4/addons/XIPivot/data/settings.xml` (ahead of global HD packs such as `NextHD` so LuckyRoll overrides their roll DATs cleanly):
    ```xml
-   <overlays>LuckyRoll,NextHD,...</overlays>
+   <overlays>LuckyRoll_BlinkSafe,NextHD,...</overlays>
    ```
 3. In-game, reload XIPivot (`//lua reload xipivot`) and zone or relog to clear any previously cached effect DATs.
+4. *(Optional)* To also stop COR **precast** weapon-swap blinks completely on your screen, enable DressUp blink prevention: `//du blinking all always on`.
 
 ---
 
@@ -120,25 +135,29 @@ No more squinting at spinning Roman numerals or guessing whether a flash in Sort
 
 ## Optional: Customizing & Rebuilding from Retail DATs
 
-You do **not** need Python or this script to use LuckyRoll — the ready-to-drop `LuckyRoll/` folder works out of the box.
+You do **not** need Python or this script to use LuckyRoll — both `LuckyRoll/` and `LuckyRoll_BlinkSafe/` work out of the box.
 
 The generator at [`tools/build_luckyroll.py`](tools/build_luckyroll.py) is included for players and modders who want to:
 - Customize number or card colors (for example, **colorblind-friendly palettes**) by editing `PALETTES` / `CARD_THEMES`.
 - Swap typography via `--font <path-to-ttf>`.
-- Regenerate clean DATs against a retail FFXI install or future FFXI client patch.
-- Audit every patched section, DXT3 texture, card mesh, and texture namespace (`--verify`).
+- Rebuild either **Standard** or **Blink-Safe** DATs against a retail FFXI install or future FFXI client patch.
+- Audit every patched section, DXT3 texture, card mesh, texture namespace, and timing curve (`--verify` / `--verify --blink-safe`).
 
 **Requirements**: Python 3.9+, `pillow`, `numpy`, and a clean retail FFXI installation containing `ROM/`.
 
 ```powershell
-# Rebuild all 44 DATs and regenerate preview sheets
+# Rebuild Standard LuckyRoll/ (44 DATs + preview sheets)
 python tools/build_luckyroll.py
 
-# Verify an existing LuckyRoll build against retail DATs
+# Rebuild Blink-Safe LuckyRoll_BlinkSafe/ (Frame-0 cards & number + extended visibility)
+python tools/build_luckyroll.py --blink-safe
+
+# Verify existing builds against retail DATs
 python tools/build_luckyroll.py --verify
+python tools/build_luckyroll.py --verify --blink-safe
 
 # Custom FFXI path + export a clean XIPivot zip
-python tools/build_luckyroll.py --ffxi-root "D:\Games\FINAL FANTASY XI" --zip LuckyRoll_XIPivot.zip
+python tools/build_luckyroll.py --blink-safe --ffxi-root "D:\Games\FINAL FANTASY XI" --zip LuckyRoll_BlinkSafe_XIPivot.zip
 ```
 
 ---

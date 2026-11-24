@@ -1519,9 +1519,19 @@ PHANTOM_EXTEND_LIFE = 150
 PHANTOM_TAIL_DELTA = PHANTOM_EXTEND_LIFE - PHANTOM_RETAIL_LIFE
 PHANTOM_PJ_GENS: Set[str] = {f"pj{i:02d}" for i in range(1, 12)} | {"pjbu"}
 PHANTOM_YC_SCHEDS: Set[str] = {f"yc{i:02d}" for i in range(1, 13)}
-PHANTOM_JA00_FLOATS: List[float] = [0.0, 0.0, 0.20, 0.42, 0.88, 0.42, 0.95, 0.04, 1.0, 0.0, 0.0, 0.0]
-PHANTOM_EARLY_JA00_FLOATS: List[float] = [0.0, 0.0, 0.08, 0.42, 0.88, 0.42, 0.95, 0.04, 1.0, 0.0, 0.0, 0.0]
+PHANTOM_W_RETAIL_LIFE = 60
+PHANTOM_W_EXTEND_LIFE = 110
+PHANTOM_W_RETAIL_DUR = 98
+PHANTOM_W_EXTEND_DUR = 148
+PHANTOM_W_GENS: Set[str] = {f"w00{i}" for i in range(1, 7)}
+PHANTOM_XC_SCHEDS: Set[str] = {f"xc0{i}" for i in range(1, 7)}
+PHANTOM_JA00_FLOATS: List[float] = [0.0, 0.0, 0.08, 0.42, 0.88, 0.42, 0.95, 0.04, 1.0, 0.0, 0.0, 0.0]
 PHANTOM_JA01_FLOATS: List[float] = [0.0, 0.0, 0.08, 0.42, 0.82, 0.42, 0.93, 0.04, 1.0, 0.0, 0.0, 0.0]
+PHANTOM_WCA1_FLOATS: List[float] = [0.0, 0.0, 0.09, 0.16, 0.18, 0.42, 1.0, 0.4198]
+PHANTOM_CCA0_FLOATS: List[float] = [
+    0.0, 0.0, 0.08, 0.06, 0.14, 0.16, 0.20, 0.42, 0.76, 0.42,
+    0.84, 0.18, 0.90, 0.08, 0.95, 0.04, 1.0, 0.0, 0.0, 0.0,
+]
 
 CARD_SP_RETAIL_LIFE = 64
 CARD_SP_EXTEND_LIFE = 120
@@ -1552,14 +1562,18 @@ def patch_0x05_life(raw: bytes, old_life: int, new_life: int) -> bytes:
     return bytes(buf)
 
 
-def patch_0x07_main_early_sum0(raw: bytes) -> bytes:
-    """Move sum0 to frame 0 in Phantom Roll 0x07 main without shifting any other timestamps."""
+def patch_0x07_main_blink_safe(raw: bytes) -> bytes:
+    """Move both sum0 and pip0 to frame 0 in Phantom Roll 0x07 main without shifting any other timestamps."""
     if len(raw) != 320 or struct.unpack_from("<III", raw, 0x24) != (0x50, 0x130, 500):
-        raise ValueError("0x07 main unexpected header/size for early sum0 patch")
+        raise ValueError("0x07 main unexpected header/size for blink-safe patch")
     if raw[0x7C:0x7E] != bytes([0x05, 0x0A]) or raw[0x84:0x88] != b"cm0?":
         raise ValueError("0x07 main missing cm0? at +0x7C")
     if struct.unpack_from("<HH", raw, 0x80) != (16, 60):
         raise ValueError("0x07 main cm0? unexpected (f1, f2)")
+    if raw[0xA4:0xA6] != bytes([0x0A, 0x08]) or raw[0xAC:0xB0] != b"7094":
+        raise ValueError("0x07 main missing 7094 at +0xA4")
+    if struct.unpack_from("<HH", raw, 0xA8) != (0, 0):
+        raise ValueError("0x07 main 7094 unexpected (f1, f2)")
     if raw[0xC4:0xC6] != bytes([0x03, 0x04]) or raw[0xCC:0xD0] != b"pip0":
         raise ValueError("0x07 main missing pip0 at +0xC4")
     if struct.unpack_from("<HH", raw, 0xC8) != (44, 0):
@@ -1576,9 +1590,14 @@ def patch_0x07_main_early_sum0(raw: bytes) -> bytes:
     buf = bytearray(raw)
     sum0_cmd = bytearray(raw[0xFC:0x10C])
     struct.pack_into("<H", sum0_cmd, 4, 0)
-    mid_block = bytearray(raw[0x7C:0xFC])
-    struct.pack_into("<H", mid_block, 0xD8 - 0x7C, 94 + 22)
-    buf[0x7C:0x10C] = bytes(sum0_cmd) + bytes(mid_block)
+    pip0_cmd = bytearray(raw[0xC4:0xD4])
+    struct.pack_into("<H", pip0_cmd, 4, 0)
+    cm0_cmd = bytearray(raw[0x7C:0xA4])
+    snd_cmd = bytearray(raw[0xA4:0xC4])
+    struct.pack_into("<H", snd_cmd, 4, 44)
+    cm1_cmd = bytearray(raw[0xD4:0xFC])
+    struct.pack_into("<H", cm1_cmd, 4, 94 + 22)
+    buf[0x7C:0x10C] = bytes(sum0_cmd + pip0_cmd + cm0_cmd + snd_cmd + cm1_cmd)
 
     off, end_off = 0x50, 0x130
     check_sum = 0
@@ -1711,66 +1730,71 @@ def _scale_0x19_interior_times(raw: bytes, ratio: float) -> bytes:
 
 def _expected_timing_count(
     timing_mode: Optional[Tuple[str, Optional[int]]],
-    extend_duration: bool,
-    early_number: bool,
+    blink_safe: bool,
 ) -> int:
-    """Return expected number of timing-patched sections for a DAT given active timing flags."""
-    if timing_mode is None:
+    """Return expected number of timing-patched sections for a DAT when blink_safe is enabled."""
+    if timing_mode is None or not blink_safe:
         return 0
     if timing_mode[0] == "phantom":
-        return (
-            (28 if extend_duration else 0)
-            + (1 if early_number else 0)
-            + (13 if (early_number and not extend_duration) else 0)
-        )
+        return 44
     if timing_mode[0] == "card_sp":
-        return 6 if extend_duration else 0
+        return 6
     raise ValueError(f"Unknown timing_mode: {timing_mode!r}")
 
 
 def patch_timing_section(
     sec: DatSection,
     timing_mode: Optional[Tuple[str, Optional[int]]],
-    extend_duration: bool = False,
-    early_number: bool = False,
+    blink_safe: bool = False,
 ) -> Optional[bytes]:
-    """Return timing-patched bytes for targeted 0x05/0x07/0x19 sections, or None if untouched."""
-    if timing_mode is None or (not extend_duration and not early_number):
+    """Return blink-safe timing-patched bytes for targeted 0x05/0x07/0x19 sections, or None if untouched."""
+    if timing_mode is None or not blink_safe:
         return None
     mode, sp_idx = timing_mode
     tag = sec.name.decode("ascii", "replace").strip()
 
     if mode == "phantom":
-        if sec.stype == 0x07 and tag == "main" and early_number:
-            return patch_0x07_main_early_sum0(sec.raw)
-        if sec.stype == 0x05 and tag in PHANTOM_PJ_GENS and extend_duration:
-            return patch_0x05_life(sec.raw, PHANTOM_RETAIL_LIFE, PHANTOM_EXTEND_LIFE)
-        if sec.stype == 0x07 and tag in PHANTOM_YC_SCHEDS:
-            new_dur = PHANTOM_EXTEND_LIFE if extend_duration else PHANTOM_RETAIL_LIFE
-            tail_delta = PHANTOM_TAIL_DELTA if extend_duration else 0
-            clear_pre = 40 if early_number else None
-            return patch_0x07_duration(
-                sec.raw,
-                PHANTOM_PJ_GENS,
-                PHANTOM_RETAIL_LIFE,
-                new_dur,
-                tail_delta,
-                clear_pre_wait=clear_pre,
-            )
+        if sec.stype == 0x07 and tag == "main":
+            return patch_0x07_main_blink_safe(sec.raw)
+        if sec.stype == 0x05:
+            if tag in PHANTOM_PJ_GENS:
+                return patch_0x05_life(sec.raw, PHANTOM_RETAIL_LIFE, PHANTOM_EXTEND_LIFE)
+            if tag in PHANTOM_W_GENS:
+                return patch_0x05_life(sec.raw, PHANTOM_W_RETAIL_LIFE, PHANTOM_W_EXTEND_LIFE)
+        if sec.stype == 0x07:
+            if tag in PHANTOM_YC_SCHEDS:
+                return patch_0x07_duration(
+                    sec.raw,
+                    PHANTOM_PJ_GENS,
+                    PHANTOM_RETAIL_LIFE,
+                    PHANTOM_EXTEND_LIFE,
+                    PHANTOM_TAIL_DELTA,
+                    clear_pre_wait=40,
+                )
+            if tag in PHANTOM_XC_SCHEDS:
+                return patch_0x07_duration(
+                    sec.raw,
+                    PHANTOM_W_GENS,
+                    PHANTOM_W_RETAIL_DUR,
+                    PHANTOM_W_EXTEND_DUR,
+                    0,
+                )
         if sec.stype == 0x19:
             if tag == "ja00":
-                return patch_0x19_floats(
-                    sec.raw, PHANTOM_EARLY_JA00_FLOATS if early_number else PHANTOM_JA00_FLOATS
-                )
-            if tag == "ja01" and extend_duration:
+                return patch_0x19_floats(sec.raw, PHANTOM_JA00_FLOATS)
+            if tag == "ja01":
                 return patch_0x19_floats(sec.raw, PHANTOM_JA01_FLOATS)
-            if tag in ("pjsx", "pjyy") and extend_duration:
+            if tag in ("pjsx", "pjyy"):
                 return _scale_0x19_interior_times(sec.raw, PHANTOM_RETAIL_LIFE / PHANTOM_EXTEND_LIFE)
+            if tag == "wca1":
+                return patch_0x19_floats(sec.raw, PHANTOM_WCA1_FLOATS)
+            if tag == "wcsx":
+                return _scale_0x19_interior_times(sec.raw, PHANTOM_W_RETAIL_LIFE / PHANTOM_W_EXTEND_LIFE)
+            if tag == "cca0":
+                return patch_0x19_floats(sec.raw, PHANTOM_CCA0_FLOATS)
         return None
 
     if mode == "card_sp":
-        if not extend_duration:
-            return None
         assert sp_idx is not None
         target_j = f"j0{sp_idx}0"
         if sec.stype == 0x05 and tag == target_j:
@@ -1858,10 +1882,9 @@ def patch_dat(
     tex_prefix: Optional[bytes],
     dxt_cache: Dict[Tuple[str, object], Tuple[int, int, bytes]],
     timing_mode: Optional[Tuple[str, Optional[int]]] = None,
-    extend_duration: bool = False,
-    early_number: bool = False,
+    blink_safe: bool = False,
 ) -> Tuple[int, int, int, int]:
-    """Patch target 0x20 textures, unwrap 0x1F card meshes, isolate tex namespaces, and optionally extend timing."""
+    """Patch target 0x20 textures, unwrap 0x1F card meshes, isolate tex namespaces, and optionally apply blink-safe timing."""
     raw = retail_path.read_bytes()
     sections = parse_sections(raw)
     out_chunks: List[bytes] = []
@@ -1898,13 +1921,7 @@ def patch_dat(
                 renamed_refs += cnt
             out_chunks.append(chunk)
         else:
-            patched_timing = (
-                patch_timing_section(
-                    sec, timing_mode, extend_duration=extend_duration, early_number=early_number
-                )
-                if (extend_duration or early_number)
-                else None
-            )
+            patched_timing = patch_timing_section(sec, timing_mode, blink_safe=blink_safe) if blink_safe else None
             if patched_timing is not None:
                 out_chunks.append(patched_timing)
                 timed += 1
@@ -1923,7 +1940,7 @@ def patch_dat(
         raise ValueError(
             f"{retail_path}: expected 38 0x1F texture ref renames, got {renamed_refs}"
         )
-    exp_timed = _expected_timing_count(timing_mode, extend_duration, early_number)
+    exp_timed = _expected_timing_count(timing_mode, blink_safe)
     if timed != exp_timed:
         raise ValueError(
             f"{retail_path}: expected {exp_timed} timing patches ({timing_mode!r}), got {timed}"
@@ -1957,13 +1974,11 @@ def _classify_decoded_color(img: Image.Image) -> str:
 def verify_pack(
     pack_dir: Path,
     retail_root: Path = RETAIL_ROOT,
-    extend_duration: bool = False,
-    early_number: bool = False,
+    blink_safe: bool = False,
 ) -> Tuple[int, int, int, int, int]:
     """Verify binary integrity, namespace isolation, card meshes, DXT3 textures, and optional timing."""
     targets = build_target_map()
-    timing_active = extend_duration or early_number
-    timing_map = build_timing_map() if timing_active else {}
+    timing_map = build_timing_map() if blink_safe else {}
     dat_count = 0
     tex_count = 0
     mesh_count = 0
@@ -2053,11 +2068,7 @@ def verify_pack(
                 renamed_refs += r_cnt
             else:
                 expected_timing = (
-                    patch_timing_section(
-                        rs, timing_mode, extend_duration=extend_duration, early_number=early_number
-                    )
-                    if timing_active
-                    else None
+                    patch_timing_section(rs, timing_mode, blink_safe=blink_safe) if blink_safe else None
                 )
                 if expected_timing is not None:
                     if ms.raw != expected_timing:
@@ -2077,7 +2088,7 @@ def verify_pack(
             for old_name in RENAMED_COR_OLD_NAMES:
                 if old_name in mod_bytes:
                     raise AssertionError(f"{rel}: leftover colliding texture name {old_name!r}")
-        exp_dat_timed = _expected_timing_count(timing_mode, extend_duration, early_number)
+        exp_dat_timed = _expected_timing_count(timing_mode, blink_safe)
         if dat_timed != exp_dat_timed:
             raise AssertionError(f"{rel}: expected {exp_dat_timed} timing sections, got {dat_timed}")
         dat_count += 1
@@ -2085,8 +2096,7 @@ def verify_pack(
     if len(unique_roll_tex_names) != 31 * 14:
         raise AssertionError(f"Expected 434 unique roll texture names, got {len(unique_roll_tex_names)}")
     expected_total_timing = sum(
-        _expected_timing_count(timing_map.get(rel), extend_duration, early_number)
-        for rel in targets
+        _expected_timing_count(timing_map.get(rel), blink_safe) for rel in targets
     )
     if timing_count != expected_total_timing:
         raise AssertionError(f"Expected {expected_total_timing} timing sections, got {timing_count}")
@@ -2379,13 +2389,11 @@ def build_all(
     retail_root: Path = RETAIL_ROOT,
     compare_root: Optional[Path] = None,
     skip_zip: bool = False,
-    extend_duration: bool = False,
-    early_number: bool = False,
+    blink_safe: bool = False,
 ) -> None:
     """Render all unique roll & card graphics once, patch all 44 retail DATs, and emit previews."""
     targets = build_target_map()
-    timing_active = extend_duration or early_number
-    timing_map = build_timing_map() if timing_active else {}
+    timing_map = build_timing_map() if blink_safe else {}
     unique_keys = sorted(
         {kv for _, spec, _, _ in targets.values() for kv in spec.values()},
         key=lambda kv: (kv[0], repr(kv[1])),
@@ -2421,15 +2429,14 @@ def build_all(
             tex_prefix,
             dxt_cache,
             timing_mode=timing_map.get(rel),
-            extend_duration=extend_duration,
-            early_number=early_number,
+            blink_safe=blink_safe,
         )
         total_tex += r_tex
         total_meshes += u_mesh
         total_renamed += r_ref
         total_timed += r_timed
 
-    timing_msg = f", {total_timed} timing secs" if timing_active else ""
+    timing_msg = f", {total_timed} blink-safe timing secs" if blink_safe else ""
     print(
         f"Patched {len(targets)} DATs ({total_tex} textures, {total_meshes} card meshes, "
         f"{total_renamed} isolated mesh refs{timing_msg}). Verifying..."
@@ -2437,10 +2444,9 @@ def build_all(
     dat_cnt, tex_cnt, mesh_cnt, uniq_cnt, ver_timed = verify_pack(
         out_pack,
         retail_root=retail_root,
-        extend_duration=extend_duration,
-        early_number=early_number,
+        blink_safe=blink_safe,
     )
-    ver_timing_msg = f", and {ver_timed} timing sections" if timing_active else ""
+    ver_timing_msg = f", and {ver_timed} blink-safe timing sections" if blink_safe else ""
     print(
         f"PASS: Verified {dat_cnt} DATs, {tex_cnt} DXT3 textures, "
         f"{mesh_cnt} card meshes, {uniq_cnt} unique roll texture names{ver_timing_msg}."
@@ -2468,17 +2474,12 @@ def build_all(
 
 def main() -> None:
     global FONT_PATH
-    parser = argparse.ArgumentParser(description="Build and verify LuckyRoll XIPivot pack.")
+    parser = argparse.ArgumentParser(description="Build and verify LuckyRoll XIPivot packs.")
     parser.add_argument("--verify", action="store_true", help="Verify an existing LuckyRoll build only.")
     parser.add_argument(
-        "--extend-duration",
+        "--blink-safe",
         action="store_true",
-        help="Extend floating result number display durations on Phantom Rolls, Wild Card, and Cutting Cards.",
-    )
-    parser.add_argument(
-        "--early-number",
-        action="store_true",
-        help="Spawn Phantom Roll total number at frame 0 (t=0.00s) before aftercast weapon-swap blinks.",
+        help="Build/verify LuckyRoll_BlinkSafe (Frame-0 cards & number + extended visibility for viewing blinking CORs).",
     )
     parser.add_argument(
         "--ffxi-root",
@@ -2486,7 +2487,12 @@ def main() -> None:
         default=RETAIL_ROOT,
         help="Path to retail FINAL FANTASY XI directory containing ROM/.",
     )
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT_PACK, help="Output pack folder.")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Output pack folder (defaults to LuckyRoll/ or LuckyRoll_BlinkSafe/ with --blink-safe).",
+    )
     parser.add_argument(
         "--preview-dir",
         type=Path,
@@ -2509,22 +2515,20 @@ def main() -> None:
     if not (retail_root / "ROM").is_dir():
         parser.error(f"Retail ROM directory not found under --ffxi-root: {retail_root}")
 
+    default_out = (REPO_ROOT / "LuckyRoll_BlinkSafe") if args.blink_safe else DEFAULT_OUT_PACK
+    out_pack: Path = args.out if args.out is not None else default_out
+
     if args.verify:
         dat_cnt, tex_cnt, mesh_cnt, uniq_cnt, ver_timed = verify_pack(
-            args.out,
+            out_pack,
             retail_root=retail_root,
-            extend_duration=args.extend_duration,
-            early_number=args.early_number,
+            blink_safe=args.blink_safe,
         )
-        if args.extend_duration or args.early_number:
-            exp_total = sum(
-                _expected_timing_count(m, args.extend_duration, args.early_number)
-                for m in build_timing_map().values()
-            )
+        if args.blink_safe:
             print(
                 f"VERIFY PASS: {dat_cnt}/44 DATs, {tex_cnt}/531 textures, "
                 f"{mesh_cnt}/301 card meshes, {uniq_cnt}/434 unique roll texture names, "
-                f"and {ver_timed}/{exp_total} timing sections verified cleanly."
+                f"and {ver_timed}/1436 blink-safe timing sections verified cleanly."
             )
         else:
             print(
@@ -2537,15 +2541,14 @@ def main() -> None:
     num_previews = [] if args.skip_previews else [args.preview_dir / "preview_numbers.png"]
     card_previews = [] if args.skip_previews else [args.preview_dir / "preview_cards.png"]
     build_all(
-        args.out,
+        out_pack,
         args.zip,
         num_previews,
         card_previews,
         retail_root=retail_root,
         compare_root=compare_root,
         skip_zip=(args.zip is None),
-        extend_duration=args.extend_duration,
-        early_number=args.early_number,
+        blink_safe=args.blink_safe,
     )
 
 
